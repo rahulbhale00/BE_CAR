@@ -3,40 +3,12 @@
     {
       "cmd": "F",
       "count": 2
-    },
-    {
-      "cmd": "L",
-      "count": 3
-    },
-    {
-      "cmd": "F",
-      "count": 2
-    },
-    {
-      "cmd": "L",
-      "count": 4
-    },
-    {
-      "cmd": "F",
-      "count": 1
     }
   ],
   "2-1": [
     {
-      "cmd": "L",
-      "count": 2
-    },
-    {
-      "cmd": "F",
-      "count": 2
-    },
-    {
-      "cmd": "L",
-      "count": 6
-    },
-    {
       "cmd": "B",
-      "count": 1
+      "count": 2
     }
   ]
 }
