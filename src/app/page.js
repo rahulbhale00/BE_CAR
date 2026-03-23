@@ -720,6 +720,14 @@ export default function Home() {
             <IconTrash /> Clear paths
           </button>
         </div>
+        <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", padding:"0 4px" }}>
+          <span className="font-mono-code" style={{ fontSize:11, color:"hsl(var(--muted-foreground))" }}>
+            BE Project Group 36
+          </span>
+          <span className="font-mono-code" style={{ fontSize:11, color:"hsl(var(--muted-foreground))" }}>
+            Guide - Dr. R. G. Yelalwar
+          </span>
+        </div>
 
       </div>
 
