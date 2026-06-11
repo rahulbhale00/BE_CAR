@@ -1,0 +1,370 @@
+// ============================================================
+//  RoboNav — ESP32 Encoder Robot
+//  Improvements:
+//  1. FULL QUADRATURE — counts all 4 edges per tick cycle
+//     Resolution: 4× more ticks per revolution (900 → 3600)
+//  2. PIVOT TURNS — only one motor runs per turn
+//     Much more consistent than spot turns (both motors fighting)
+//  3. Separate forward and turn speeds
+//  4. Active braking
+// ============================================================
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+// ── WiFi & MQTT ──────────────────────────────────────────────
+const char* ssid        = "Rahul_bhale";
+const char* password    = "rsbhale00";
+const char* mqtt_server = "10.251.95.138";
+const int   mqtt_port   = 1883;
+
+// ── Motor Pins ───────────────────────────────────────────────
+#define IN1 16
+#define IN2 17
+#define IN3  4
+#define IN4 15
+#define ENA 26
+#define ENB 14
+
+// ── Encoder Pins ─────────────────────────────────────────────
+#define ENC_L_A 34
+#define ENC_L_B 35
+#define ENC_R_A 32
+#define ENC_R_B 33
+
+// ── Encoder counts ───────────────────────────────────────────
+volatile long countL = 0;
+volatile long countR = 0;
+
+// ── Speeds ───────────────────────────────────────────────────
+int speedFwd  = 180;  // PWM for forward/backward
+int speedTurn = 100;  // PWM for turns — lower = more accurate
+
+// ── Accel settle + brake ─────────────────────────────────────
+const int ACCEL_SETTLE_MS = 150;
+const int BRAKE_PULSE_MS  = 45;
+
+WiFiClient   espClient;
+PubSubClient mqttClient(espClient);
+
+// ── FULL QUADRATURE ISRs ──────────────────────────────────────
+// Count ALL edges of both A and B signals
+// This gives 4× the resolution vs counting only A changes
+// At 900 ticks/rev with single-edge: 900 ticks/rev
+// With full quadrature: 3600 ticks/rev
+
+void IRAM_ATTR isrLA() {   // Left A changed
+  bool a = digitalRead(ENC_L_A);
+  bool b = digitalRead(ENC_L_B);
+  if (a == b) countL++; else countL--;
+}
+
+void IRAM_ATTR isrLB() {   // Left B changed
+  bool a = digitalRead(ENC_L_A);
+  bool b = digitalRead(ENC_L_B);
+  if (a != b) countL++; else countL--;
+}
+
+void IRAM_ATTR isrRA() {   // Right A changed
+  bool a = digitalRead(ENC_R_A);
+  bool b = digitalRead(ENC_R_B);
+  if (a != b) countR++; else countR--;
+}
+
+void IRAM_ATTR isrRB() {   // Right B changed
+  bool a = digitalRead(ENC_R_A);
+  bool b = digitalRead(ENC_R_B);
+  if (a == b) countR++; else countR--;
+}
+
+// ── Motor helpers ─────────────────────────────────────────────
+void stopMotors() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+}
+
+void stopLeft() {
+  // Active brake left — reverse pulse then stop
+  if (BRAKE_PULSE_MS > 0) {
+    analogWrite(ENA, 80);
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    delay(BRAKE_PULSE_MS);
+  }
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  analogWrite(ENA, 0);
+}
+
+void stopRight() {
+  if (BRAKE_PULSE_MS > 0) {
+    analogWrite(ENB, 80);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+    delay(BRAKE_PULSE_MS);
+  }
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENB, 0);
+}
+
+void brakeBoth() {
+  if (BRAKE_PULSE_MS > 0) {
+    analogWrite(ENA, 80); analogWrite(ENB, 80);
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+    delay(BRAKE_PULSE_MS);
+  }
+  stopMotors();
+}
+
+// ── FORWARD ──────────────────────────────────────────────────
+void moveForward(long target) {
+  // Start both motors
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, speedFwd);
+  analogWrite(ENB, speedFwd);
+
+  // Wait for stable speed then reset and count
+  delay(ACCEL_SETTLE_MS);
+  countL = 0; countR = 0;
+
+  bool leftDone = false, rightDone = false;
+
+while (!leftDone || !rightDone) {
+
+  if (!leftDone && abs(countL) >= target) {
+    stopLeft();
+    leftDone = true;
+  }
+
+  if (!rightDone && abs(countR) >= target) {
+    stopRight();
+    rightDone = true;
+  }
+
+  yield();
+}
+
+  stopMotors();
+  Serial.printf("DONE F | L:%ld R:%ld\n", countL, countR);
+}
+
+// ── BACKWARD ─────────────────────────────────────────────────
+void moveBackward(long target) {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  analogWrite(ENA, speedFwd);
+  analogWrite(ENB, speedFwd);
+
+  delay(ACCEL_SETTLE_MS);
+  countL = 0; countR = 0;
+
+  bool leftDone = false, rightDone = false;
+
+  while (!leftDone || !rightDone) {
+    if (!leftDone && abs(countL) >= target) {
+      stopLeft();
+      leftDone = true;
+    }
+    if (!rightDone && abs(countR) >= target) {
+      stopRight();
+      rightDone = true;
+    }
+    yield();
+  }
+
+  stopMotors();
+  Serial.printf("DONE B | L:%ld R:%ld\n", countL, countR);
+}
+
+// ── LEFT TURN — PIVOT on left wheel ──────────────────────────
+// ONLY RIGHT motor runs forward
+// Left motor is fully stopped and braked
+// This is a PIVOT turn — much more consistent than spot turn
+// Car pivots around the LEFT wheel
+void moveLeft(long target) {
+  // Ensure left motor is completely stopped and braked
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  analogWrite(ENA, 0);
+
+  // Only right motor runs
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENB, speedTurn);
+
+  // Settle then count only right encoder
+  delay(ACCEL_SETTLE_MS);
+  countR = 0;
+
+  // while (abs(countR) < target) {
+  //   yield();
+  // }
+
+  const int OVERSHOOT_TICKS = 0; // tune this — start at 2
+
+  while (abs(countR) < (target - OVERSHOOT_TICKS)) {
+    yield();
+  }
+
+
+
+  // Stop right with brake
+  if (BRAKE_PULSE_MS > 0) {
+    analogWrite(ENB, 80);
+    digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+    delay(BRAKE_PULSE_MS);
+  }
+  stopMotors();
+
+  Serial.printf("DONE L | R:%ld\n", countR);
+}
+
+// ── RIGHT TURN — PIVOT on right wheel ────────────────────────
+// ONLY LEFT motor runs forward
+// Right motor is fully stopped and braked
+void moveRight(long target) {
+  // Ensure right motor completely stopped
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+  analogWrite(ENB, 0);
+
+  // Only left motor runs
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  analogWrite(ENA, speedTurn);
+
+  delay(ACCEL_SETTLE_MS);
+  countL = 0;
+
+  // while (abs(countL) < target) {
+  //   yield();
+  // }
+
+  
+  const int OVERSHOOT_TICKS = 0; // tune this — start at 2
+
+  while (abs(countL) < (target - OVERSHOOT_TICKS)) {
+    yield();
+  }
+
+  if (BRAKE_PULSE_MS > 0) {
+    analogWrite(ENA, 80);
+    digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+    delay(BRAKE_PULSE_MS);
+  }
+  stopMotors();
+
+  Serial.printf("DONE R | L:%ld\n", countL);
+}
+
+// ── MQTT Callback ─────────────────────────────────────────────
+void callback(char* topic, byte* payload, unsigned int length) {
+  String msg = "";
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  msg.trim();
+
+  Serial.println("RECV: [" + msg + "]");
+
+  if (msg == "S") { stopMotors(); return; }
+
+  // SPD:<value> — forward speed
+  // Turn speed auto-set to 55% of forward speed
+  if (msg.startsWith("SPD:")) {
+    int s     = msg.substring(4).toInt();
+    speedFwd  = constrain(s, 80, 255);
+    speedTurn = constrain((int)(speedFwd * 0.55f), 50, 180);
+    Serial.printf("Speed Fwd:%d Turn:%d\n", speedFwd, speedTurn);
+    return;
+  }
+
+  // SPDT:<value> — set turn speed directly
+  if (msg.startsWith("SPDT:")) {
+    speedTurn = constrain(msg.substring(5).toInt(), 40, 200);
+    Serial.printf("Turn speed: %d\n", speedTurn);
+    return;
+  }
+
+  if (msg.startsWith("EXEC:")) {
+    if (msg.length() < 8) return;
+    char cmd   = msg.charAt(5);
+    int col2   = msg.indexOf(':', 6);
+    if (col2 < 0) return;
+    long ticks = msg.substring(col2 + 1).toInt();
+    if (ticks <= 0 || ticks > 999999) return;
+
+    Serial.printf("EXEC %c ticks:%ld fwd:%d turn:%d\n",
+                  cmd, ticks, speedFwd, speedTurn);
+
+    switch (cmd) {
+      case 'F': moveForward(ticks);  break;
+      case 'B': moveBackward(ticks); break;
+      case 'L': moveLeft(ticks);     break;
+      case 'R': moveRight(ticks);    break;
+    }
+
+    Serial.println("EXEC done");
+    mqttClient.publish("robot/status", "done");
+    return;
+  }
+}
+
+// ── WiFi ──────────────────────────────────────────────────────
+void connectWiFi() {
+  Serial.print("WiFi");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\nIP: " + WiFi.localIP().toString());
+}
+
+// ── MQTT ──────────────────────────────────────────────────────
+void connectMQTT() {
+  while (!mqttClient.connected()) {
+    String id = "RoboNav_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    if (mqttClient.connect(id.c_str())) {
+      mqttClient.subscribe("robot/control");
+      Serial.println("MQTT OK");
+    } else {
+      Serial.printf("MQTT fail rc=%d\n", mqttClient.state());
+      delay(2000);
+    }
+  }
+}
+
+// ── Setup ─────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n=== RoboNav Full Quadrature + Pivot Turn ===");
+
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  stopMotors();
+
+  // Encoder pins
+  // GPIO 34/35 are input-only, no internal pullup
+  // GPIO 32/33 support INPUT_PULLUP
+  pinMode(ENC_L_A, INPUT);
+  pinMode(ENC_L_B, INPUT);
+  pinMode(ENC_R_A, INPUT_PULLUP);
+  pinMode(ENC_R_B, INPUT_PULLUP);
+
+  // Full quadrature — interrupt on ALL 4 encoder edges
+  attachInterrupt(digitalPinToInterrupt(ENC_L_A), isrLA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_B), isrLB, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_A), isrRA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_B), isrRB, CHANGE);
+
+  Serial.printf("Full quadrature active — ~3600 ticks/rev\n");
+  Serial.printf("Pivot turns — one motor only for L/R\n");
+  Serial.printf("Fwd:%d Turn:%d\n", speedFwd, speedTurn);
+
+  connectWiFi();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(callback);
+
+  Serial.println("Ready.");
+}
+
+// ── Loop ──────────────────────────────────────────────────────
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (!mqttClient.connected()) connectMQTT();
+  mqttClient.loop();
+}
