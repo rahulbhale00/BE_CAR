@@ -4,7 +4,7 @@ import { useEffect, useState, useRef } from "react";
 import { connectMQTT, sendCommand } from "@/lib/mqtt";
 
 // ── Default tick values (editable in Settings panel) ─────────────────────────
-const DEFAULT_TICKS = { F: 20, B: 20, L: 7, R: 7 };
+const DEFAULT_TICKS = { F: 20, B: 20, L: 90, R: 90 };
 
 // Gap between clicks in auto mode (ms) — counters inertia/friction
 const AUTO_GAP_MS = 200;
@@ -135,7 +135,7 @@ function SettingsPanel({ ticks, onSave, onClose }) {
         <div style={{ padding:"20px 24px", display:"flex", flexDirection:"column", gap:16 }}>
 
           <p style={{ fontSize:13, color:"hsl(var(--muted-foreground))", margin:0, lineHeight:1.5 }}>
-            Each arrow click sends this many encoder ticks to the ESP32. The motor runs until the wheel rotates that many ticks, then stops.
+            Each forward/backward click sends encoder ticks. Each left/right click sends target degrees (phone gyro).
           </p>
 
           {dirs.map(({ key, label, icon }) => (
@@ -163,7 +163,9 @@ function SettingsPanel({ ticks, onSave, onClose }) {
                   textAlign:"right",
                 }}
               />
-              <span style={{ fontSize:12, color:"hsl(var(--muted-foreground))", width:32 }}>ticks</span>
+              <span style={{ fontSize:12, color:"hsl(var(--muted-foreground))", width:32 }}>
+                {key === "L" || key === "R" ? "deg" : "ticks"}
+              </span>
             </div>
           ))}
 
@@ -615,7 +617,8 @@ export default function Home() {
   // We use 3000ms as a generous fixed wait per click so we never overlap.
   // The settings gap (autoGapRef) is added on top for inertia/friction settling.
 
-  const EXEC_WAIT_MS = 3000; // generous wait for ESP32 to finish one click
+  const EXEC_WAIT_MS_FWD = 3000;
+  const EXEC_WAIT_MS_TURN = 8000; // generous wait for ESP32 to finish one click
 
   const handleClick = async (cmd) => {
     if (busyRef.current || isRunning) return;
@@ -643,7 +646,8 @@ export default function Home() {
     sendCommand(`EXEC:${cmd}:${clickTicks}`);
 
     // Wait for ESP32 to finish + inertia gap
-    await delay(EXEC_WAIT_MS + autoGapRef.current);
+    const waitMs = (cmd === "L" || cmd === "R") ? EXEC_WAIT_MS_TURN : EXEC_WAIT_MS_FWD;
+    await delay(waitMs + autoGapRef.current);
 
     setStatus("STOP");
     busyRef.current = false;
@@ -755,7 +759,8 @@ export default function Home() {
           sendCommand(`EXEC:${step.cmd}:${step.ticks}`);
 
           // Wait for ESP32 to finish running the motor + inertia gap
-          await delay(EXEC_WAIT_MS + autoGapRef.current);
+          const autoWait = (step.cmd === "L" || step.cmd === "R") ? EXEC_WAIT_MS_TURN : EXEC_WAIT_MS_FWD;
+          await delay(autoWait + autoGapRef.current);
 
           setStatus("STOP");
         }
@@ -968,6 +973,11 @@ export default function Home() {
           <span style={{ fontSize:11, color:"hsl(var(--muted-foreground))", fontFamily:"monospace" }}>
             BE Project Group 36
           </span>
+          <a href="/gyro" target="_blank" style={{
+            fontSize:11, color:"hsl(var(--primary))", textDecoration:"none", fontFamily:"monospace",
+          }}>
+            📱 Phone Gyro
+          </a>
           <button
             onClick={clearPaths}
             disabled={busy || isRunning}

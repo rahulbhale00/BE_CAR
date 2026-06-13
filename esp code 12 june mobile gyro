@@ -1,0 +1,603 @@
+// ============================================================
+//  RoboNav — ESP32 with Phone Gyro Turns (v4 — Clean Algorithm)
+//
+//  TURN ALGORITHM (2-phase):
+//
+//  PHASE 1 — Coarse turn:
+//    a. Reset phone delta to 0, confirm near-zero
+//    b. Run motors at TURN_SPEED (PWM 100) unconditionally
+//    c. Stop hard when delta >= COARSE_STOP_DEG (70°)
+//    d. Do NOT read angle during motor run — avoids MQTT lag error
+//
+//  PHASE 2 — Settle + Nudge correction:
+//    a. Wait for robot to physically settle (delta stable < 0.3° change)
+//    b. Read settled angle, compute error = TARGET - settled
+//    c. If |error| <= DEAD_BAND → done
+//    d. Otherwise: nudge motors briefly, wait for settle, re-read
+//    e. Repeat nudge until within DEAD_BAND
+//
+//  Key insight: NEVER trust angle reading while motors are on.
+//  Always wait for full physical settle before reading error.
+//
+//  Forward/Backward: encoder-based (unchanged)
+// ============================================================
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+
+const char* ssid        = "Rahul_bhale";
+const char* password    = "rsbhale00";
+const char* mqtt_server = "10.251.95.138";
+const int   mqtt_port   = 1883;
+
+// ── Motor pins ────────────────────────────────────────────────
+#define IN1 16
+#define IN2 17
+#define IN3  4
+#define IN4 15
+#define ENA 26
+#define ENB 14
+
+// ── Encoder pins ──────────────────────────────────────────────
+#define ENC_L_A 34
+#define ENC_L_B 35
+#define ENC_R_A 32
+#define ENC_R_B 33
+
+volatile long countL = 0;
+volatile long countR = 0;
+
+// ── Speed settings ────────────────────────────────────────────
+int speedFwd   = 120;   // forward/backward speed
+int speedTurn  = 120;   // coarse turn speed (phase 1)
+int speedNudge = 120;   // correction nudge speed (phase 2)
+
+// ── Forward/backward encoder config ──────────────────────────
+const int   ACCEL_SETTLE_MS = 100;
+const int   BRAKE_PULSE_MS  = 30;
+const int   OVERSHOOT_COMP  = 1;
+const int   DECEL_TICKS     = 8;
+const int   SLOW_SPEED      = 55;
+const float SYNC_KP         = 1.5f;
+const int   MAX_SYNC_CORR   = 50;
+
+// ── Turn algorithm config ─────────────────────────────────────
+const float TARGET_DEG       = 90.0f;  // desired turn angle
+const float COARSE_STOP_DEG  = 70.0f;  // stop motors here in phase 1
+                                        // robot coasts remaining ~20° naturally
+
+const float DEAD_BAND_DEG    = 1.0f;   // acceptable final error (±2°)
+
+// Settle detection: wait until two readings differ < SETTLE_THRESH
+const float SETTLE_THRESH    = 0.3f;   // degrees — if delta changes less than this = settled
+const int   SETTLE_CHECK_MS  = 100;    // gap between settle readings (ms)
+const int   SETTLE_TIMEOUT_MS = 2000;  // max wait for settle
+
+// Nudge config
+const int   NUDGE_MS         = 40;     // how long each nudge runs motors (ms)
+const int   MAX_NUDGES       = 20;     // safety: max correction nudges
+const int   RESET_WAIT_MS    = 500;    // wait for phone to process RESET command
+
+// Turn safety
+const int   TURN_TIMEOUT_MS  = 8000;  // max time for phase 1 (coarse)
+
+// ── Phone gyro data ───────────────────────────────────────────
+volatile float phoneDelta     = 0;
+volatile float phoneYaw       = 0;
+volatile bool  phoneConnected = false;
+volatile unsigned long phoneLastMsg = 0;
+
+WiFiClient   espClient;
+PubSubClient mqttClient(espClient);
+
+// ── ISRs ──────────────────────────────────────────────────────
+void IRAM_ATTR isrLA() { bool a=digitalRead(ENC_L_A),b=digitalRead(ENC_L_B); countL+=(a==b)?1:-1; }
+void IRAM_ATTR isrLB() { bool a=digitalRead(ENC_L_A),b=digitalRead(ENC_L_B); countL+=(a!=b)?1:-1; }
+void IRAM_ATTR isrRA() { bool a=digitalRead(ENC_R_A),b=digitalRead(ENC_R_B); countR+=(a!=b)?1:-1; }
+void IRAM_ATTR isrRB() { bool a=digitalRead(ENC_R_A),b=digitalRead(ENC_R_B); countR+=(a==b)?1:-1; }
+
+// ── Motor helpers ─────────────────────────────────────────────
+void stopMotors() {
+  digitalWrite(IN1,LOW); digitalWrite(IN2,LOW);
+  digitalWrite(IN3,LOW); digitalWrite(IN4,LOW);
+  analogWrite(ENA,0);    analogWrite(ENB,0);
+}
+
+void brakeLeft() {
+  if (BRAKE_PULSE_MS > 0) {
+    analogWrite(ENA,70); digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH);
+    delay(BRAKE_PULSE_MS);
+  }
+  digitalWrite(IN1,LOW); digitalWrite(IN2,LOW); analogWrite(ENA,0);
+}
+
+void brakeRight() {
+  if (BRAKE_PULSE_MS > 0) {
+    analogWrite(ENB,70); digitalWrite(IN3,LOW); digitalWrite(IN4,HIGH);
+    delay(BRAKE_PULSE_MS);
+  }
+  digitalWrite(IN3,LOW); digitalWrite(IN4,LOW); analogWrite(ENB,0);
+}
+
+void setTurnMotors(bool isLeft, int spd) {
+  if (isLeft) {
+    digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH);
+    digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  } else {
+    digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+    digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  }
+  analogWrite(ENA, spd);
+  analogWrite(ENB, spd);
+}
+
+// ── MQTT pump ─────────────────────────────────────────────────
+void pumpMQTT() {
+  mqttClient.loop();
+}
+
+// Pump for a fixed duration — ensures we get latest phoneDelta
+void pumpFor(int ms) {
+  unsigned long end = millis() + ms;
+  while (millis() < end) {
+    pumpMQTT();
+    delay(5);
+  }
+}
+
+// ── Get turn progress as positive number ──────────────────────
+// LEFT turns → phoneDelta goes positive
+// RIGHT turns → phoneDelta goes negative
+// Returns positive progress value regardless of direction
+float getProgress(bool isLeft) {
+  return isLeft ? phoneDelta : -phoneDelta;
+}
+
+// ── Wait for robot to physically settle ───────────────────────
+// Reads progress repeatedly until it stops changing
+// Returns the settled angle
+float waitForSettle(bool isLeft) {
+  Serial.println("[SETTLE] Waiting for robot to physically settle...");
+
+  float prev    = getProgress(isLeft);
+  float settled = prev;
+  int   stableCount = 0;
+  unsigned long start = millis();
+
+  while (millis() - start < SETTLE_TIMEOUT_MS) {
+    pumpFor(SETTLE_CHECK_MS);
+    float curr = getProgress(isLeft);
+    float change = abs(curr - prev);
+
+    Serial.printf("[SETTLE]   reading=%.2f°  prev=%.2f°  change=%.3f°\n",
+                  curr, prev, change);
+
+    if (change < SETTLE_THRESH) {
+      stableCount++;
+      if (stableCount >= 2) {
+        // Two consecutive stable readings = fully settled
+        settled = curr;
+        Serial.printf("[SETTLE] Stable! Final settled angle = %.2f°\n", settled);
+        return settled;
+      }
+    } else {
+      stableCount = 0; // still moving, reset counter
+    }
+    prev = curr;
+  }
+
+  // Timeout — return whatever we have
+  settled = getProgress(isLeft);
+  Serial.printf("[SETTLE] Timeout — using last reading = %.2f°\n", settled);
+  return settled;
+}
+
+// ── Forward / backward (encoder sync — unchanged) ────────────
+void syncDrive(long target, int baseSpeed, bool leftFwd, bool rightFwd) {
+  long stopAt = target - OVERSHOOT_COMP;
+
+  digitalWrite(IN1, leftFwd  ? HIGH : LOW); digitalWrite(IN2, leftFwd  ? LOW  : HIGH);
+  digitalWrite(IN3, rightFwd ? HIGH : LOW); digitalWrite(IN4, rightFwd ? LOW  : HIGH);
+  analogWrite(ENA, baseSpeed); analogWrite(ENB, baseSpeed);
+
+  delay(ACCEL_SETTLE_MS);
+  countL = 0; countR = 0;
+
+  while (true) {
+    long absL = abs(countL), absR = abs(countR);
+    if (absL >= stopAt && absR >= stopAt) break;
+
+    if (absL >= stopAt) {
+      brakeLeft(); analogWrite(ENB, SLOW_SPEED);
+      while (abs(countR) < stopAt) yield(); break;
+    }
+    if (absR >= stopAt) {
+      brakeRight(); analogWrite(ENA, SLOW_SPEED);
+      while (abs(countL) < stopAt) yield(); break;
+    }
+
+    long remaining = stopAt - max(absL, absR);
+    int base = (remaining <= DECEL_TICKS)
+      ? max((int)(SLOW_SPEED + (float)remaining/DECEL_TICKS*(baseSpeed-SLOW_SPEED)), SLOW_SPEED)
+      : baseSpeed;
+
+    long err = absL - absR;
+    int corr = constrain((int)(SYNC_KP * err), -MAX_SYNC_CORR, MAX_SYNC_CORR);
+    analogWrite(ENA, constrain(base - corr, SLOW_SPEED, 255));
+    analogWrite(ENB, constrain(base + corr, SLOW_SPEED, 255));
+    yield();
+  }
+
+  stopMotors();
+  Serial.printf("[FWD/BWD] Done | L:%ld R:%ld\n", abs(countL), abs(countR));
+}
+
+// ══════════════════════════════════════════════════════════════
+//  MAIN TURN FUNCTION — 2-phase algorithm
+// ══════════════════════════════════════════════════════════════
+void doTurn(float targetDeg, bool isLeft) {
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.printf( "║  TURN %s  |  target=%.1f°          \n", isLeft ? "LEFT " : "RIGHT", targetDeg);
+  Serial.println("╚══════════════════════════════════════╝");
+
+  // ── Pre-check: phone connected? ────────────────────────────
+  Serial.println("\n[PRE] Checking phone gyro connection...");
+  if (!phoneConnected || (millis() - phoneLastMsg > 2000)) {
+    Serial.println("[PRE] !! FAIL — Phone gyro not connected");
+    Serial.println("[PRE]    Open /gyro in Firefox and tap Start Gyroscope");
+    Serial.println("[PRE]    Turn aborted.\n");
+    return;
+  }
+  Serial.printf("[PRE] Phone OK | last msg %lums ago | current delta=%.2f°\n",
+                millis() - phoneLastMsg, phoneDelta);
+
+  // ══════════════════════════════════════════════════
+  //  STEP 1 — Reset phone delta to zero
+  // ══════════════════════════════════════════════════
+  Serial.println("\n[STEP 1] Resetting phone delta to zero...");
+  mqttClient.publish("robot/gyro_cmd", "RESET");
+  Serial.printf("[STEP 1] RESET sent to phone. Waiting %dms for confirmation...\n", RESET_WAIT_MS);
+
+  pumpFor(RESET_WAIT_MS);
+
+  float afterReset = getProgress(isLeft);
+  Serial.printf("[STEP 1] phoneDelta after reset = %.2f°  (want < 5°)\n", phoneDelta);
+
+  if (abs(afterReset) > 10.0f) {
+    Serial.println("[STEP 1] !! Delta still large — sending RESET again...");
+    mqttClient.publish("robot/gyro_cmd", "RESET");
+    pumpFor(RESET_WAIT_MS);
+    afterReset = getProgress(isLeft);
+    Serial.printf("[STEP 1] Second reset result = %.2f°\n", afterReset);
+  }
+
+  if (abs(afterReset) > 15.0f) {
+    Serial.println("[STEP 1] !! WARN — delta not resetting cleanly, proceeding anyway");
+    Serial.println("[STEP 1]    Check phone /gyro page is open and streaming");
+  } else {
+    Serial.printf("[STEP 1] Reset confirmed. Starting from %.2f°\n", afterReset);
+  }
+
+  // ══════════════════════════════════════════════════
+  //  STEP 2 — Coarse turn: run until COARSE_STOP_DEG
+  //  (do NOT read angle to stop — just watch progress)
+  // ══════════════════════════════════════════════════
+  Serial.printf("\n[STEP 2] Starting coarse turn at PWM %d...\n", speedTurn);
+  Serial.printf("[STEP 2] Will stop motors when progress >= %.1f° (coarse stop)\n", COARSE_STOP_DEG);
+  Serial.printf("[STEP 2] Robot will coast remaining ~%.0f° naturally\n", targetDeg - COARSE_STOP_DEG);
+
+  countL = 0; countR = 0;
+  setTurnMotors(isLeft, speedTurn);
+
+  unsigned long turnStart = millis();
+  float progress = 0;
+  unsigned long lastPrint = 0;
+
+  while (true) {
+    pumpMQTT(); // keep getting phone updates
+    progress = getProgress(isLeft);
+
+    // Print progress every 150ms
+    if (millis() - lastPrint > 150) {
+      lastPrint = millis();
+      Serial.printf("[STEP 2]   progress=%.1f°  (stop at %.1f°)  L:%ld R:%ld\n",
+                    progress, COARSE_STOP_DEG, abs(countL), abs(countR));
+    }
+
+    // ── Stop condition: reached coarse stop angle ──────────
+    if (progress >= COARSE_STOP_DEG) {
+      stopMotors();
+      Serial.printf("[STEP 2] ✓ Coarse stop reached!\n");
+      Serial.printf("[STEP 2]   Motor stopped at progress=%.2f°  encoders L:%ld R:%ld\n",
+                    progress, abs(countL), abs(countR));
+      Serial.printf("[STEP 2]   Expected coast to bring us close to %.1f°\n", targetDeg);
+      break;
+    }
+
+    // ── Safety timeout ─────────────────────────────────────
+    if (millis() - turnStart > TURN_TIMEOUT_MS) {
+      stopMotors();
+      Serial.printf("[STEP 2] !! TIMEOUT after %dms at %.1f°\n", TURN_TIMEOUT_MS, progress);
+      Serial.println("[STEP 2]    Check: phone streaming? MQTT connected?");
+      break;
+    }
+
+    // ── Safety: phone disconnected mid-turn ────────────────
+    if (millis() - phoneLastMsg > 1500) {
+      stopMotors();
+      Serial.println("[STEP 2] !! Phone gyro lost during coarse turn — stopping");
+      break;
+    }
+
+    yield();
+  }
+
+  // ══════════════════════════════════════════════════
+  //  STEP 3 — Wait for robot to fully settle
+  //  (coast + physical rest before reading angle)
+  // ══════════════════════════════════════════════════
+  Serial.println("\n[STEP 3] Motors stopped. Letting robot coast and settle...");
+  float settledAngle = waitForSettle(isLeft);
+
+  float error = targetDeg - settledAngle;
+  Serial.printf("\n[STEP 3] Settled angle = %.2f°\n", settledAngle);
+  Serial.printf("[STEP 3] Target        = %.2f°\n", targetDeg);
+  Serial.printf("[STEP 3] Error         = %.2f° (%s)\n",
+                error, error > 0 ? "UNDERSHOT — need more" : "OVERSHOT — need to reverse");
+
+  // ══════════════════════════════════════════════════
+  //  STEP 4 — Check if within dead band
+  // ══════════════════════════════════════════════════
+  Serial.printf("\n[STEP 4] Dead band = ±%.1f°  |  Error = %.2f°\n", DEAD_BAND_DEG, error);
+
+  if (abs(error) <= DEAD_BAND_DEG) {
+    Serial.println("[STEP 4] ✓ Within dead band — no correction needed!");
+    Serial.println("[STEP 4]   Turn complete on coarse phase alone.");
+  } else {
+    // ══════════════════════════════════════════════
+    //  STEP 5 — Nudge correction loop
+    //  Each nudge: run motors briefly → wait settle → re-read
+    // ══════════════════════════════════════════════
+    Serial.printf("\n[STEP 5] Correction needed: %.2f° error\n", error);
+    Serial.printf("[STEP 5] Starting nudge correction (max %d nudges, %dms each)\n",
+                  MAX_NUDGES, NUDGE_MS);
+    Serial.println("[STEP 5] Each nudge: motors ON → wait settle → read angle → decide next");
+
+    int nudgeCount = 0;
+
+    while (nudgeCount < MAX_NUDGES) {
+      nudgeCount++;
+      bool nudgeForward = (error > 0); // undershot → same direction, overshot → reverse
+
+      Serial.printf("\n[STEP 5] --- Nudge #%d ---\n", nudgeCount);
+      Serial.printf("[STEP 5]   Current error=%.2f°  direction=%s\n",
+                    error, nudgeForward ? (isLeft ? "LEFT" : "RIGHT") : (isLeft ? "RIGHT" : "LEFT"));
+
+      // Fire nudge
+      if (nudgeForward) {
+        setTurnMotors(isLeft, speedNudge);   // same direction as main turn
+      } else {
+        setTurnMotors(!isLeft, speedNudge);  // reverse to correct overshoot
+      }
+
+      Serial.printf("[STEP 5]   Motors ON for %dms...\n", NUDGE_MS);
+      delay(NUDGE_MS);
+      stopMotors();
+      Serial.println("[STEP 5]   Motors OFF. Waiting for settle...");
+
+      // Wait for physical settle after nudge
+      float nudgeSettled = waitForSettle(isLeft);
+      error = targetDeg - nudgeSettled;
+
+      Serial.printf("[STEP 5]   After nudge #%d: angle=%.2f°  error=%.2f°\n",
+                    nudgeCount, nudgeSettled, error);
+
+      // Check dead band
+      if (abs(error) <= DEAD_BAND_DEG) {
+        Serial.printf("[STEP 5] ✓ Within dead band after nudge #%d!\n", nudgeCount);
+        break;
+      }
+
+      // Safety: if error is getting worse (oscillating), stop
+      if (nudgeCount > 3 && abs(error) > 20.0f) {
+        Serial.println("[STEP 5] !! Error growing — stopping correction to prevent oscillation");
+        break;
+      }
+    }
+
+    if (nudgeCount >= MAX_NUDGES) {
+      Serial.printf("[STEP 5] !! Max nudges (%d) reached\n", MAX_NUDGES);
+    }
+  }
+
+  // ══════════════════════════════════════════════════
+  //  FINAL REPORT
+  // ══════════════════════════════════════════════════
+  // One final settle + read for accurate final report
+  pumpFor(200);
+  float finalAngle = getProgress(isLeft);
+  float finalError = targetDeg - finalAngle;
+
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println("║           TURN COMPLETE              ║");
+  Serial.println("╚══════════════════════════════════════╝");
+  Serial.printf("  Target  : %.1f°\n", targetDeg);
+  Serial.printf("  Final   : %.2f°\n", finalAngle);
+  Serial.printf("  Error   : %.2f°  %s\n", finalError,
+                abs(finalError) <= DEAD_BAND_DEG ? "✓ GOOD" : "✗ OUTSIDE DEAD BAND");
+  Serial.printf("  Encoders: L:%ld  R:%ld\n\n", abs(countL), abs(countR));
+}
+
+// ── Public move functions ─────────────────────────────────────
+void moveForward(long t)  {
+  Serial.printf("\n[FWD] %ld ticks at PWM %d\n", t, speedFwd);
+  syncDrive(t, speedFwd, true, true);
+}
+void moveBackward(long t) {
+  Serial.printf("\n[BWD] %ld ticks at PWM %d\n", t, speedFwd);
+  syncDrive(t, speedFwd, false, false);
+}
+void moveLeft(float deg)  { doTurn(deg, true);  }
+void moveRight(float deg) { doTurn(deg, false); }
+
+// ── MQTT Callback ─────────────────────────────────────────────
+void callback(char* topic, byte* payload, unsigned int len) {
+  String msg = "";
+  for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
+  msg.trim();
+  String topicStr = String(topic);
+
+  // ── Phone gyro data ──────────────────────────────────────────
+  if (topicStr == "robot/gyro") {
+    phoneLastMsg  = millis();
+    phoneConnected = true;
+
+    if (msg == "RESET") {
+      phoneDelta = 0;
+      return;
+    }
+
+    // Parse "YAW:123.45|DELTA:45.23"
+    int yawIdx   = msg.indexOf("YAW:");
+    int pipeIdx  = msg.indexOf("|");
+    int deltaIdx = msg.indexOf("DELTA:");
+
+    if (yawIdx >= 0 && pipeIdx > 0)
+      phoneYaw = msg.substring(yawIdx + 4, pipeIdx).toFloat();
+    if (deltaIdx >= 0)
+      phoneDelta = msg.substring(deltaIdx + 6).toFloat();
+
+    return;
+  }
+
+  // ── Robot control commands ───────────────────────────────────
+  if (topicStr == "robot/control") {
+    Serial.println("\nRECV: [" + msg + "]");
+
+    if (msg == "S") {
+      stopMotors();
+      Serial.println("[CMD] Emergency stop");
+      return;
+    }
+
+    if (msg.startsWith("SPD:")) {
+      speedFwd = constrain(msg.substring(4).toInt(), 60, 255);
+      Serial.printf("[CMD] speedFwd set to %d\n", speedFwd);
+      return;
+    }
+
+    if (msg.startsWith("EXEC:")) {
+      if (msg.length() < 8) return;
+      char cmd  = msg.charAt(5);
+      int  col2 = msg.indexOf(':', 6);
+      if (col2 < 0) return;
+      long val = msg.substring(col2 + 1).toInt();
+      if (val <= 0 || val > 999999) return;
+
+      Serial.printf("[CMD] EXEC %c val:%ld\n", cmd, val);
+
+      switch (cmd) {
+        case 'F': moveForward(val);      break;
+        case 'B': moveBackward(val);     break;
+        case 'L': moveLeft((float)val);  break;
+        case 'R': moveRight((float)val); break;
+      }
+
+      mqttClient.publish("robot/status", "done");
+      return;
+    }
+  }
+}
+
+// ── WiFi / MQTT ───────────────────────────────────────────────
+void connectWiFi() {
+  Serial.print("[WIFI] Connecting");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n[WIFI] Connected | IP: " + WiFi.localIP().toString());
+}
+
+void connectMQTT() {
+  while (!mqttClient.connected()) {
+    String id = "RoboNav_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    if (mqttClient.connect(id.c_str())) {
+      mqttClient.subscribe("robot/control");
+      mqttClient.subscribe("robot/gyro");
+      Serial.println("[MQTT] Connected | subscribed: robot/control + robot/gyro");
+    } else {
+      Serial.printf("[MQTT] Failed rc=%d — retry in 2s\n", mqttClient.state());
+      delay(2000);
+    }
+  }
+}
+
+// ── Setup ─────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n╔══════════════════════════════════════╗");
+  Serial.println("║  RoboNav v4 — Phone Gyro Turn Algo  ║");
+  Serial.println("╚══════════════════════════════════════╝");
+
+  // Motor pins
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT);
+  pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  pinMode(ENA,OUTPUT); pinMode(ENB,OUTPUT);
+  stopMotors();
+  Serial.println("[SETUP] Motor pins OK");
+
+  // Encoder pins
+  pinMode(ENC_L_A, INPUT);
+  pinMode(ENC_L_B, INPUT);
+  pinMode(ENC_R_A, INPUT_PULLUP);
+  pinMode(ENC_R_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_A), isrLA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_B), isrLB, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_A), isrRA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_B), isrRB, CHANGE);
+  Serial.println("[SETUP] Encoder pins OK");
+
+  // Network
+  connectWiFi();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(callback);
+  connectMQTT();
+
+  Serial.println("\n[SETUP] === READY ===");
+  Serial.println("[SETUP] Waiting for phone gyro on robot/gyro...");
+  Serial.println("[SETUP] Open http://<laptop-ip>:3000/gyro in Firefox on phone");
+  Serial.println("[SETUP] Tap 'Start Gyroscope' on phone");
+  Serial.println("[SETUP] ──────────────────────────────────────");
+  Serial.printf( "[SETUP] Turn config:\n");
+  Serial.printf( "[SETUP]   Target       = %.1f°\n", TARGET_DEG);
+  Serial.printf( "[SETUP]   Coarse stop  = %.1f°\n", COARSE_STOP_DEG);
+  Serial.printf( "[SETUP]   Dead band    = ±%.1f°\n", DEAD_BAND_DEG);
+  Serial.printf( "[SETUP]   Turn PWM     = %d\n", speedTurn);
+  Serial.printf( "[SETUP]   Nudge PWM    = %d\n", speedNudge);
+  Serial.printf( "[SETUP]   Nudge dur    = %dms\n", NUDGE_MS);
+  Serial.printf( "[SETUP]   Settle check = every %dms, thresh=%.1f°\n",
+                 SETTLE_CHECK_MS, SETTLE_THRESH);
+}
+
+// ── Loop ──────────────────────────────────────────────────────
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (!mqttClient.connected()) connectMQTT();
+  mqttClient.loop();
+
+  // Phone connection monitor (every 3s)
+  static bool wasConnected = false;
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 3000) {
+    lastCheck = millis();
+    bool now = (millis() - phoneLastMsg < 2000);
+    if (now && !wasConnected) {
+      Serial.printf("\n[PHONE] Gyro connected ✓  delta=%.2f°  yaw=%.2f°\n",
+                    phoneDelta, phoneYaw);
+    }
+    if (!now && wasConnected) {
+      Serial.println("\n[PHONE] Gyro disconnected ✗");
+    }
+    wasConnected = now;
+  }
+}

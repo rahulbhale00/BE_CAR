@@ -2,35 +2,50 @@
   "1-2": [
     {
       "cmd": "F",
-      "count": 2,
-      "ticks": 20
+      "count": 1,
+      "ticks": 70
     },
     {
       "cmd": "R",
       "count": 1,
-      "ticks": 13
+      "ticks": 90
     },
     {
       "cmd": "F",
       "count": 1,
-      "ticks": 20
+      "ticks": 70
     },
     {
       "cmd": "R",
       "count": 1,
-      "ticks": 13
+      "ticks": 90
     },
     {
       "cmd": "F",
-      "count": 2,
-      "ticks": 20
+      "count": 1,
+      "ticks": 70
+    },
+    {
+      "cmd": "R",
+      "count": 1,
+      "ticks": 90
+    },
+    {
+      "cmd": "F",
+      "count": 1,
+      "ticks": 70
+    },
+    {
+      "cmd": "R",
+      "count": 1,
+      "ticks": 90
     }
   ],
   "2-1": [
     {
       "cmd": "F",
       "count": 1,
-      "ticks": 20
+      "ticks": 70
     }
   ]
 }
