@@ -3,7 +3,7 @@
     {
       "cmd": "F",
       "count": 1,
-      "ticks": 70
+      "ticks": 400
     },
     {
       "cmd": "R",
@@ -13,7 +13,7 @@
     {
       "cmd": "F",
       "count": 1,
-      "ticks": 70
+      "ticks": 400
     },
     {
       "cmd": "R",
@@ -23,17 +23,7 @@
     {
       "cmd": "F",
       "count": 1,
-      "ticks": 70
-    },
-    {
-      "cmd": "R",
-      "count": 1,
-      "ticks": 90
-    },
-    {
-      "cmd": "F",
-      "count": 1,
-      "ticks": 70
+      "ticks": 400
     },
     {
       "cmd": "R",
@@ -45,7 +35,7 @@
     {
       "cmd": "F",
       "count": 1,
-      "ticks": 70
+      "ticks": 400
     }
   ]
 }

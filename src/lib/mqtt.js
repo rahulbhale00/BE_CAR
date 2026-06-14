@@ -44,3 +44,15 @@ export const sendCommand = (cmd) => {
     connectMQTT();
   }
 };
+
+// Generic publish to any topic (used for robot/audio_cmd, etc.)
+export const publishTopic = (topic, msg) => {
+  if (client && client.connected) {
+    client.publish(topic, msg);
+    console.log(`Pub [${topic}]:`, msg);
+  } else {
+    console.log("MQTT not connected — cannot publish", topic);
+    client = null;
+    connectMQTT();
+  }
+};
