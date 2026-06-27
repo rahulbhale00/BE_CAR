@@ -745,6 +745,8 @@ export default function Home() {
   const [isRunning, setIsRunning] = useState(false);
   const [log, setLog] = useState("");
   const [speed, setSpeed] = useState(120);
+  const [trim, setTrim] = useState(0);          // straight-line balance (-120..120)
+  const [trimSaved, setTrimSaved] = useState(false);
   const [pathPreview, setPathPreview] = useState([]);
   const [busy, setBusy] = useState(false);
   const [mqttOk, setMqttOk] = useState(false);
@@ -1200,7 +1202,8 @@ export default function Home() {
       {alertDialog && <ObstacleAlertDialog dist={alertDialog.dist} onDismiss={dismissAlert} />}
       {autoDialog && <AutoObstacleDialog dist={autoDialog.dist} busyLabel={autoBusyLabel} onChoose={resolveAutoChoice} />}
 
-      <div style={{ width: "100%", maxWidth: 480, display: "flex", flexDirection: "column", gap: 14, paddingTop: 8, paddingBottom: 32 }}>
+      <div className={"rn-shell" + (mode === "control" ? " rn-control" : "")}>
+        <div className="rn-col rn-left">
 
         {/* Header */}
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", paddingTop: 4 }}>
@@ -1228,7 +1231,10 @@ export default function Home() {
         {/* Car POV camera */}
         {/* <CameraFeed defaultIp="10.251.95.46" startStreaming /> */}
         {/* <CameraFeed defaultIp="10.251.95.46" startStreaming aiModel="Xenova/yolos-tiny" /> */}
-        <CameraFeed defaultIp="10.251.95.46" startStreaming rotation={90} />
+        <div className="rn-cam"><CameraFeed defaultIp="10.251.95.46" startStreaming rotation={90} /></div>
+
+        </div>{/* /rn-left */}
+        <div className="rn-col rn-right">
 
         {/* Obstacle detection control — toggle + live danger distance */}
         <div style={{
@@ -1305,13 +1311,44 @@ export default function Home() {
           <SpeedControl speed={speed} onChange={(s) => { setSpeed(s); sendCommand(`SPD:${s}`); }} />
         )}
 
+        {/* Straight-line trim — fixes consistent left/right veer on F/B */}
+        <div style={{ borderRadius: 12, border: "1px solid hsl(var(--border))", background: "hsl(var(--card))", padding: "12px 14px", display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ fontSize: 13, fontWeight: 600, color: "hsl(var(--foreground))" }}>Straight-line trim</span>
+            <span style={{ fontSize: 13, fontWeight: 700, fontFamily: "monospace", color: "hsl(var(--primary))" }}>
+              {trim > 0 ? `+${trim}` : trim}
+            </span>
+          </div>
+          <input
+            type="range" min={-120} max={120} step={1} value={trim}
+            onChange={(e) => { const v = parseInt(e.target.value, 10); setTrim(v); setTrimSaved(false); sendCommand(`SPDBAL:${v}`); }}
+            style={{ width: "100%", accentColor: "hsl(var(--primary))" }}
+          />
+          <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, color: "hsl(var(--muted-foreground))", fontFamily: "monospace" }}>
+            <span>← veers left</span><span>straight</span><span>veers right →</span>
+          </div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ flex: 1, fontSize: 11, color: "hsl(var(--muted-foreground))" }}>
+              Adjust until a fixed step drives straight, then save so it sticks after restart.
+            </span>
+            <button
+              onClick={() => { sendCommand(`SPDBALSET:${trim}`); setTrimSaved(true); }}
+              style={{
+                border: "1px solid hsl(var(--border))", borderRadius: 8, padding: "6px 12px", cursor: "pointer", flexShrink: 0,
+                fontSize: 12, fontWeight: 700, background: trimSaved ? "hsl(var(--primary))" : "hsl(var(--card))",
+                color: trimSaved ? "hsl(var(--primary-foreground))" : "hsl(var(--foreground))", transition: "all 0.15s",
+              }}
+            >{trimSaved ? "Saved ✓" : "Set as default"}</button>
+          </div>
+        </div>
+
         {/* Log */}
         {log && (
           <div style={{ borderRadius: 12, background: "hsl(var(--secondary) / 0.6)", padding: "10px 16px", fontSize: 14, fontWeight: 500, color: "hsl(var(--secondary-foreground))" }}>{log}</div>
         )}
 
         {/* Drive pad */}
-        <div style={{ borderRadius: 16, border: "1px solid hsl(var(--border))", background: "hsl(var(--card))", padding: 24, display: "flex", flexDirection: "column", alignItems: "center", gap: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}>
+        <div className="rn-pad" style={{ borderRadius: 16, border: "1px solid hsl(var(--border))", background: "hsl(var(--card))", padding: 24, display: "flex", flexDirection: "column", alignItems: "center", gap: 16, boxShadow: "0 2px 8px rgba(0,0,0,0.04)" }}>
           {mode === "control" ? (
             <>
               <HoldPad onStart={onHoldStart} onEnd={onHoldEnd} activeCmd={holdCmd} disabled={isRunning} />
@@ -1352,12 +1389,36 @@ export default function Home() {
         <div style={{ display: "flex", justifyContent: "center", padding: "0 4px" }}>
           <span style={{ fontSize: 11, color: "hsl(var(--muted-foreground))", fontFamily: "monospace" }}>Guide — Dr. R. G. Yelalwar</span>
         </div>
+        </div>{/* /rn-right */}
       </div>
 
       <style>{`
         @keyframes spin { to { transform: rotate(360deg); } }
         @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
         @keyframes slide-up-fade { from{opacity:0;transform:translateY(12px) scale(0.98)} to{opacity:1;transform:translateY(0) scale(1)} }
+
+        /* ── Responsive layout ───────────────────────────────────── */
+        .rn-shell { width: 100%; max-width: 480px; display: flex; flex-direction: column; gap: 14px; padding: 8px 0 32px; }
+        .rn-col   { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+        /* Desktop: two columns — media (distance + camera) | controls */
+        @media (min-width: 900px) {
+          .rn-shell { max-width: 980px; display: grid; align-items: start;
+                      grid-template-columns: minmax(0, 460px) minmax(0, 1fr); gap: 20px; padding-bottom: 24px; }
+          .rn-left  { position: sticky; top: 12px; }
+        }
+
+        /* Mobile: in CONTROL mode, pin the drive pad to the bottom of the
+           viewport so the camera (top) and the controls (bottom) are both
+           visible at once — no scrolling needed while driving. */
+        @media (max-width: 899px) {
+          .rn-control { padding-bottom: 250px; }
+          .rn-control .rn-pad {
+            position: fixed; left: 50%; transform: translateX(-50%); bottom: 10px;
+            width: calc(100% - 24px); max-width: 468px; z-index: 50;
+            box-shadow: 0 6px 28px rgba(0,0,0,0.22);
+          }
+        }
       `}</style>
     </div>
   );

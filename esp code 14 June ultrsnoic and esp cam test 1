@@ -1,0 +1,614 @@
+// ============================================================
+//  RoboNav v7 — ESP32 + Phone Gyro Turns + Obstacle Detection
+//
+//  NEW IN v7:
+//   * GYRO HEADING-HOLD on forward AND backward: holds a straight
+//     line using the phone yaw (compensates weight/wheel veer on
+//     rough floors). Falls back to encoder sync if phone drops.
+//   * RUNTIME obstacle distance: "ODIST:<cm>" sets danger threshold
+//     live (no reflash). Default raised 25 -> 50 cm.
+//   * Obstacle detection ON/OFF: "ODET:1" / "ODET:0".
+//   * Turn & nudge speeds settable live: "SPDT:<pwm>" / "SPDN:<pwm>".
+//   * Active brake pulse on obstacle stop (snappier, less coast).
+//   * MQTT is pumped during forward/backward so yaw stays fresh.
+//
+//  CHANGES vs v5 (per field testing):
+//   * RELIABLE ULTRASONIC: one ping per cycle (HC-SR04 needs ~60ms
+//     between pings — v5 fired 3 pings 0.8ms apart which produced
+//     garbage). Detection now uses HYSTERESIS (closeHits 0..3, trips
+//     at >=2) so a single dropped read no longer flips the result.
+//   * SERVO IS NOT MOVED. It is centered once in setup() and held
+//     straight. No sweep. (We'll add scanning back later.)
+//   * LIVE DISTANCE: every ping is published to robot/obstacle (with
+//     DET:0 until a real trip) so the web app can show distance live
+//     and draw the radar dot correctly.
+//   * TIERED NUDGE CORRECTION for turns:
+//        |err|>20  -> big nudge   (fast)
+//        |err|>10  -> medium
+//        |err|>5   -> small
+//        |err|<=5  -> precise (the original 40ms that works great)
+//   * TURN ABORT RELAXED: removed the ">20deg => stop" rule that
+//     randomly killed good turns. Now only stops on GENUINE
+//     divergence (error grows for several nudges in a row).
+//
+//  MQTT
+//    SUB : robot/control  (EXEC / DRIVE / SPD / S / SCAN)
+//          robot/gyro
+//    PUB : robot/status   ("done" / "obstacle")
+//          robot/gyro_cmd ("RESET")
+//          robot/obstacle ("DET:0|DIST:42.0|ANG:0|REMAIN:0|CMD:F|MODE:drive")
+// ============================================================
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <ESP32Servo.h>   // Library Manager: "ESP32Servo"
+
+const char* ssid        = "Rahul_bhale";
+const char* password    = "rsbhale00";
+const char* mqtt_server = "10.251.95.138";
+const int   mqtt_port   = 1883;
+
+// ── Motor pins ────────────────────────────────────────────────
+#define IN1 16
+#define IN2 17
+#define IN3  4
+#define IN4 15
+#define ENA 26
+#define ENB 14
+
+// ── Encoder pins ──────────────────────────────────────────────
+#define ENC_L_A 34
+#define ENC_L_B 35
+#define ENC_R_A 32
+#define ENC_R_B 33
+
+// ── Servo + Ultrasonic ────────────────────────────────────────
+#define SERVO_PIN 2     // "D2" = GPIO2 — servo held STRAIGHT, never moved
+#define TRIG_PIN  13
+#define ECHO_PIN  12    // 5V echo → use a 1k/2k divider to 3.3V!
+
+Servo scanServo;
+
+volatile long countL = 0;
+volatile long countR = 0;
+
+// ── Speed settings ────────────────────────────────────────────
+int speedFwd   = 120;
+int speedTurn  = 120;
+int speedNudge = 120;
+
+// ── Forward/backward encoder config ──────────────────────────
+const int   ACCEL_SETTLE_MS = 100;
+const int   BRAKE_PULSE_MS  = 30;
+const int   OVERSHOOT_COMP  = 1;
+const int   DECEL_TICKS     = 8;
+const int   SLOW_SPEED      = 55;
+const float SYNC_KP         = 1.5f;
+const int   MAX_SYNC_CORR   = 50;
+
+// ── Turn algorithm config ─────────────────────────────────────
+const float TARGET_DEG       = 90.0f;
+const float COARSE_STOP_DEG  = 70.0f;
+const float DEAD_BAND_DEG    = 1.0f;
+const float SETTLE_THRESH    = 0.3f;
+const int   SETTLE_CHECK_MS  = 100;
+const int   SETTLE_TIMEOUT_MS = 2000;
+const int   RESET_WAIT_MS    = 500;
+const int   TURN_TIMEOUT_MS  = 8000;
+const int   MAX_NUDGES       = 25;
+
+// Tiered nudge durations (ms) — bigger error = longer (faster) nudge
+const int   NUDGE_MS         = 40;    // <=5 deg  (precise — unchanged)
+const int   NUDGE_SML_MS     = 55;    // 5-10 deg
+const int   NUDGE_MED_MS     = 80;    // 10-20 deg
+const int   NUDGE_BIG_MS     = 130;   // >20 deg
+
+// ── Gyro heading-hold (straight-line drive) config ────────────
+// While driving F/B we steer to keep phone yaw == start yaw.
+// steer(PWM) = KP_YAW * headingErr(deg). Tune KP_YAW if it weaves
+// (too high = oscillates, too low = still drifts).
+const float KP_YAW         = 6.0f;   // PWM per degree of heading error
+const int   MAX_HEAD_CORR  = 70;     // clamp on heading steer (PWM)
+const float HEAD_DEADBAND  = 1.0f;   // deg — ignore tiny errors (no jitter)
+const int   GYRO_FRESH_MS  = 800;    // phone yaw older than this = stale
+
+// ── Obstacle / ultrasonic config ──────────────────────────────
+int         obstacleCm        = 50;    // RUNTIME danger threshold (ODIST:)
+bool        obstacleEnabled   = true;  // RUNTIME on/off (ODET:0/1)
+const int   DRIVE_PING_MS     = 70;    // ping cadence while moving (>=60!)
+const int   IDLE_PING_MS      = 150;   // ping cadence while idle (radar)
+const float DRIVE_PING_MAXCM  = 160.0; // echo timeout range while moving
+const float IDLE_PING_MAXCM   = 260.0; // echo timeout range while idle
+const float MIN_VALID_CM      = 2.0;   // below this = invalid reading
+
+// ── Continuous drive state (Control mode hold-to-move) ────────
+volatile char driveDir = 0;            // 0 = stopped, else 'F''B''L''R'
+
+// ── Phone gyro data ───────────────────────────────────────────
+volatile float phoneDelta     = 0;
+volatile float phoneYaw       = 0;
+volatile bool  phoneConnected = false;
+volatile unsigned long phoneLastMsg = 0;
+
+WiFiClient   espClient;
+PubSubClient mqttClient(espClient);
+
+// ── ISRs ──────────────────────────────────────────────────────
+void IRAM_ATTR isrLA() { bool a=digitalRead(ENC_L_A),b=digitalRead(ENC_L_B); countL+=(a==b)?1:-1; }
+void IRAM_ATTR isrLB() { bool a=digitalRead(ENC_L_A),b=digitalRead(ENC_L_B); countL+=(a!=b)?1:-1; }
+void IRAM_ATTR isrRA() { bool a=digitalRead(ENC_R_A),b=digitalRead(ENC_R_B); countR+=(a!=b)?1:-1; }
+void IRAM_ATTR isrRB() { bool a=digitalRead(ENC_R_A),b=digitalRead(ENC_R_B); countR+=(a==b)?1:-1; }
+
+// ── Motor helpers ─────────────────────────────────────────────
+// Wrap an angle into [-180,180]
+float wrap180(float a) { while (a > 180) a -= 360; while (a < -180) a += 360; return a; }
+
+void stopMotors() {
+  digitalWrite(IN1,LOW); digitalWrite(IN2,LOW);
+  digitalWrite(IN3,LOW); digitalWrite(IN4,LOW);
+  analogWrite(ENA,0);    analogWrite(ENB,0);
+}
+void brakeLeft() {
+  if (BRAKE_PULSE_MS > 0) { analogWrite(ENA,70); digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH); delay(BRAKE_PULSE_MS); }
+  digitalWrite(IN1,LOW); digitalWrite(IN2,LOW); analogWrite(ENA,0);
+}
+void brakeRight() {
+  if (BRAKE_PULSE_MS > 0) { analogWrite(ENB,70); digitalWrite(IN3,LOW); digitalWrite(IN4,HIGH); delay(BRAKE_PULSE_MS); }
+  digitalWrite(IN3,LOW); digitalWrite(IN4,LOW); analogWrite(ENB,0);
+}
+void setTurnMotors(bool isLeft, int spd) {
+  if (isLeft) { digitalWrite(IN1, LOW);  digitalWrite(IN2, HIGH); digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW); }
+  else        { digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH); }
+  analogWrite(ENA, spd); analogWrite(ENB, spd);
+}
+void setForwardMotors(bool fwd, int spd) {
+  digitalWrite(IN1, fwd ? HIGH : LOW); digitalWrite(IN2, fwd ? LOW  : HIGH);
+  digitalWrite(IN3, fwd ? HIGH : LOW); digitalWrite(IN4, fwd ? LOW  : HIGH);
+  analogWrite(ENA, spd); analogWrite(ENB, spd);
+}
+// Brief active brake (reverse pulse) to kill forward momentum fast.
+void hardBrake() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  analogWrite(ENA, 110); analogWrite(ENB, 110);
+  delay(45);
+  stopMotors();
+}
+
+// ── MQTT pump ─────────────────────────────────────────────────
+void pumpMQTT() { mqttClient.loop(); }
+void pumpFor(int ms) { unsigned long end = millis() + ms; while (millis() < end) { pumpMQTT(); delay(5); } }
+
+// ══════════════════════════════════════════════════════════════
+//  ULTRASONIC — single reliable ping (NO rapid multi-ping)
+// ══════════════════════════════════════════════════════════════
+float readDistanceOnce(float maxCm) {
+  long timeoutUs = (long)(maxCm * 58.0) + 600;
+  digitalWrite(TRIG_PIN, LOW);  delayMicroseconds(3);
+  digitalWrite(TRIG_PIN, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  long dur = pulseIn(ECHO_PIN, HIGH, timeoutUs);
+  if (dur == 0) return -1.0;                  // no echo within range
+  float cm = dur / 58.0;
+  if (cm < MIN_VALID_CM) return -1.0;         // below sensor floor = noise
+  return cm;
+}
+
+// On-demand front check (3 spaced reads, return closest valid).
+float scanFront() {
+  float best = -1;
+  for (int i = 0; i < 3; i++) {
+    float d = readDistanceOnce(DRIVE_PING_MAXCM);
+    if (d > 0 && (best < 0 || d < best)) best = d;
+    delay(60);                                 // proper HC-SR04 spacing
+  }
+  return best;
+}
+
+// Publish one reading. detected = robot SHOULD stop (true only on real trip).
+void publishObstacle(bool detected, float distCm, int relAngle,
+                     long remainTicks, char cmd, const char* modeStr) {
+  char buf[96];
+  snprintf(buf, sizeof(buf),
+           "DET:%d|DIST:%.1f|ANG:%d|REMAIN:%ld|CMD:%c|MODE:%s",
+           detected ? 1 : 0, distCm < 0 ? 999.0 : distCm,
+           relAngle, remainTicks, cmd ? cmd : '-', modeStr);
+  mqttClient.publish("robot/obstacle", buf);
+}
+
+// ── Get turn progress as positive number ──────────────────────
+float getProgress(bool isLeft) { return isLeft ? phoneDelta : -phoneDelta; }
+
+// ── Wait for robot to physically settle ───────────────────────
+float waitForSettle(bool isLeft) {
+  float prev = getProgress(isLeft);
+  float settled = prev;
+  int   stableCount = 0;
+  unsigned long start = millis();
+  while (millis() - start < SETTLE_TIMEOUT_MS) {
+    pumpFor(SETTLE_CHECK_MS);
+    float curr = getProgress(isLeft);
+    if (abs(curr - prev) < SETTLE_THRESH) {
+      stableCount++;
+      if (stableCount >= 2) { return curr; }
+    } else { stableCount = 0; }
+    prev = curr;
+  }
+  return getProgress(isLeft);
+}
+
+// Pick nudge duration from current error magnitude.
+int nudgeDurationFor(float absErr) {
+  if (absErr > 20.0f) return NUDGE_BIG_MS;
+  if (absErr > 10.0f) return NUDGE_MED_MS;
+  if (absErr >  5.0f) return NUDGE_SML_MS;
+  return NUDGE_MS;            // precise
+}
+
+// ══════════════════════════════════════════════════════════════
+//  FORWARD / BACKWARD (encoder sync) + OBSTACLE DETECTION
+//  Returns remaining ticks (0 = full; >0 = stopped early by obstacle)
+// ══════════════════════════════════════════════════════════════
+long syncDrive(long target, int baseSpeed, bool leftFwd, bool rightFwd) {
+  long stopAt = target - OVERSHOOT_COMP;
+  bool isForward  = (leftFwd && rightFwd);
+  bool isBackward = (!leftFwd && !rightFwd);
+  bool straight   = isForward || isBackward;
+
+  digitalWrite(IN1, leftFwd  ? HIGH : LOW); digitalWrite(IN2, leftFwd  ? LOW  : HIGH);
+  digitalWrite(IN3, rightFwd ? HIGH : LOW); digitalWrite(IN4, rightFwd ? LOW  : HIGH);
+  analogWrite(ENA, baseSpeed); analogWrite(ENB, baseSpeed);
+
+  delay(ACCEL_SETTLE_MS);
+  countL = 0; countR = 0;
+
+  // ── Heading-hold reference (phone yaw at the moment we start) ──
+  // steerSign flips for backward: same PWM bias rotates the body the
+  // opposite way in reverse, so we negate to correct the same drift.
+  float headRef   = phoneYaw;
+  int   steerSign = isForward ? +1 : -1;
+  bool  haveGyro  = phoneConnected && (millis() - phoneLastMsg < GYRO_FRESH_MS);
+
+  unsigned long lastPing = 0;
+  int closeHits = 0;    // hysteresis 0..3
+
+  while (true) {
+    pumpMQTT();    // keep phone yaw fresh + receive 'S' during the move
+    long absL = abs(countL), absR = abs(countR);
+    if (absL >= stopAt && absR >= stopAt) break;
+
+    // ── Obstacle ping (forward only, rate-limited, if enabled) ──
+    if (isForward && obstacleEnabled && (millis() - lastPing > DRIVE_PING_MS)) {
+      lastPing = millis();
+      float d = readDistanceOnce(DRIVE_PING_MAXCM);
+      bool close = (d > 0 && d <= obstacleCm);
+      closeHits = close ? min(closeHits + 1, 3) : max(closeHits - 1, 0);
+
+      long done = max(absL, absR);
+      long remaining = target - done; if (remaining < 0) remaining = 0;
+
+      if (closeHits >= 2) {
+        hardBrake();
+        Serial.printf("[OBST] Forward blocked %.1fcm | done=%ld remain=%ld\n", d, done, remaining);
+        publishObstacle(true, d, 0, remaining, 'F', "drive");
+        return remaining;
+      }
+      publishObstacle(false, d, 0, remaining, 'F', "drive");   // live distance
+    }
+
+    if (absL >= stopAt) { brakeLeft();  analogWrite(ENB, SLOW_SPEED); while (abs(countR) < stopAt) yield(); break; }
+    if (absR >= stopAt) { brakeRight(); analogWrite(ENA, SLOW_SPEED); while (abs(countL) < stopAt) yield(); break; }
+
+    long remainingTicks = stopAt - max(absL, absR);
+    int base = (remainingTicks <= DECEL_TICKS)
+      ? max((int)(SLOW_SPEED + (float)remainingTicks/DECEL_TICKS*(baseSpeed-SLOW_SPEED)), SLOW_SPEED)
+      : baseSpeed;
+
+    // ── Steering correction ─────────────────────────────────────
+    // Convention: steer>0 => speed up LEFT (ENA), slow RIGHT (ENB).
+    // Primary: gyro heading-hold. Fallback: encoder tick sync.
+    float steer;
+    bool gyroFresh = straight && phoneConnected && (millis() - phoneLastMsg < GYRO_FRESH_MS);
+    if (gyroFresh) {
+      float headErr = wrap180(phoneYaw - headRef);     // + = veered LEFT (CCW)
+      if (fabs(headErr) < HEAD_DEADBAND) headErr = 0;
+      steer = KP_YAW * headErr * (float)steerSign;
+      steer = constrain(steer, -(float)MAX_HEAD_CORR, (float)MAX_HEAD_CORR);
+    } else {
+      long err = absL - absR;                          // left ahead => slow left
+      steer = -SYNC_KP * (float)err;
+      steer = constrain(steer, -(float)MAX_SYNC_CORR, (float)MAX_SYNC_CORR);
+    }
+    analogWrite(ENA, constrain(base + (int)steer, SLOW_SPEED, 255));
+    analogWrite(ENB, constrain(base - (int)steer, SLOW_SPEED, 255));
+    yield();
+  }
+
+  stopMotors();
+  Serial.printf("[FWD/BWD] Done | L:%ld R:%ld | gyro=%s\n",
+                abs(countL), abs(countR), haveGyro ? "hold" : "encoder");
+  return 0;
+}
+
+// ══════════════════════════════════════════════════════════════
+//  MAIN TURN — coarse + tiered nudge correction
+// ══════════════════════════════════════════════════════════════
+void doTurn(float targetDeg, bool isLeft) {
+  Serial.printf("\n[TURN %s] target=%.1f\n", isLeft ? "LEFT" : "RIGHT", targetDeg);
+
+  if (!phoneConnected || (millis() - phoneLastMsg > 2000)) {
+    Serial.println("[PRE] FAIL — phone gyro not connected. Turn aborted.");
+    return;
+  }
+
+  // STEP 1 — reset phone delta
+  mqttClient.publish("robot/gyro_cmd", "RESET");
+  pumpFor(RESET_WAIT_MS);
+  if (abs(getProgress(isLeft)) > 10.0f) { mqttClient.publish("robot/gyro_cmd", "RESET"); pumpFor(RESET_WAIT_MS); }
+
+  // STEP 2 — coarse turn
+  countL = 0; countR = 0;
+  setTurnMotors(isLeft, speedTurn);
+  unsigned long turnStart = millis();
+  while (true) {
+    pumpMQTT();
+    if (getProgress(isLeft) >= COARSE_STOP_DEG)  { stopMotors(); break; }
+    if (millis() - turnStart > TURN_TIMEOUT_MS)  { stopMotors(); break; }
+    if (millis() - phoneLastMsg > 1500)          { stopMotors(); break; }
+    yield();
+  }
+
+  // STEP 3 — settle + read
+  float settledAngle = waitForSettle(isLeft);
+  float error = targetDeg - settledAngle;
+  Serial.printf("[STEP3] settled=%.2f err=%.2f\n", settledAngle, error);
+
+  // STEP 4/5 — tiered nudge correction
+  if (abs(error) > DEAD_BAND_DEG) {
+    int   nudgeCount  = 0;
+    float prevAbs     = abs(error);
+    int   worseStreak = 0;
+
+    while (nudgeCount < MAX_NUDGES) {
+      nudgeCount++;
+      float ae   = abs(error);
+      int   dur  = nudgeDurationFor(ae);
+      bool  fwd  = (error > 0);     // undershoot => continue, overshoot => reverse
+
+      Serial.printf("[STEP5] nudge#%d err=%.2f dur=%dms %s\n",
+                    nudgeCount, error, dur, fwd ? "fwd" : "rev");
+
+      if (fwd) setTurnMotors(isLeft, speedNudge);
+      else     setTurnMotors(!isLeft, speedNudge);
+      delay(dur);
+      stopMotors();
+
+      float settled = waitForSettle(isLeft);
+      error = targetDeg - settled;
+      float nae = abs(error);
+
+      if (nae <= DEAD_BAND_DEG) {
+        Serial.printf("[STEP5] within dead band after #%d (err=%.2f)\n", nudgeCount, error);
+        break;
+      }
+
+      // genuine-divergence guard: only stop if error keeps GROWING
+      if (nae > prevAbs + 0.5f) worseStreak++; else worseStreak = 0;
+      prevAbs = nae;
+      if (worseStreak >= 4) {
+        Serial.println("[STEP5] genuine divergence — stopping to avoid oscillation");
+        break;
+      }
+    }
+  }
+
+  pumpFor(150);
+  float finalAngle = getProgress(isLeft);
+  Serial.printf("[TURN DONE] target=%.1f final=%.2f err=%.2f\n",
+                targetDeg, finalAngle, targetDeg - finalAngle);
+}
+
+// ── Public move functions (EXEC tick-based) ───────────────────
+long moveForward(long t)  { Serial.printf("\n[FWD] %ld ticks\n", t); return syncDrive(t, speedFwd, true, true); }
+void moveBackward(long t) { Serial.printf("\n[BWD] %ld ticks\n", t); syncDrive(t, speedFwd, false, false); }
+void moveLeft(float deg)  { doTurn(deg, true);  }
+void moveRight(float deg) { doTurn(deg, false); }
+
+// ══════════════════════════════════════════════════════════════
+//  CONTINUOUS DRIVE (Control mode hold-to-move)
+// ══════════════════════════════════════════════════════════════
+void startDrive(char dir) {
+  driveDir = dir;
+  switch (dir) {
+    case 'F': setForwardMotors(true,  speedFwd); break;
+    case 'B': setForwardMotors(false, speedFwd); break;
+    case 'L': setTurnMotors(true,     speedTurn); break;
+    case 'R': setTurnMotors(false,    speedTurn); break;
+    default:  stopMotors(); driveDir = 0;        break;
+  }
+}
+void stopDrive() { driveDir = 0; stopMotors(); }
+
+// loop() service — obstacle watch + live distance while holding forward
+void serviceDrive() {
+  if (driveDir != 'F') return;
+  static unsigned long lastPing = 0;
+  static int closeHits = 0;
+  if (millis() - lastPing < DRIVE_PING_MS) return;
+  lastPing = millis();
+
+  float d = readDistanceOnce(DRIVE_PING_MAXCM);
+  bool close = (d > 0 && d <= obstacleCm);
+  closeHits = close ? min(closeHits + 1, 3) : max(closeHits - 1, 0);
+
+  if (obstacleEnabled && closeHits >= 2) {
+    hardBrake(); driveDir = 0; closeHits = 0;
+    Serial.printf("[OBST] Control forward blocked %.1fcm\n", d);
+    publishObstacle(true, d, 0, 0, 'F', "control");
+  } else {
+    publishObstacle(false, d, 0, 0, 'F', "control");   // live distance
+  }
+}
+
+// loop() service — idle ping for radar / live distance (servo stays straight)
+void serviceIdlePing() {
+  if (driveDir != 0) return;
+  static unsigned long last = 0;
+  if (millis() - last < IDLE_PING_MS) return;
+  last = millis();
+  float d = readDistanceOnce(IDLE_PING_MAXCM);
+  bool close = (obstacleEnabled && d > 0 && d <= obstacleCm);
+  publishObstacle(close, d, 0, 0, '-', "scan");
+}
+
+// ── MQTT Callback ─────────────────────────────────────────────
+void callback(char* topic, byte* payload, unsigned int len) {
+  String msg = "";
+  for (unsigned int i = 0; i < len; i++) msg += (char)payload[i];
+  msg.trim();
+  String topicStr = String(topic);
+
+  if (topicStr == "robot/gyro") {
+    phoneLastMsg = millis(); phoneConnected = true;
+    if (msg == "RESET") { phoneDelta = 0; return; }
+    int yawIdx = msg.indexOf("YAW:"), pipeIdx = msg.indexOf("|"), deltaIdx = msg.indexOf("DELTA:");
+    if (yawIdx >= 0 && pipeIdx > 0) phoneYaw   = msg.substring(yawIdx + 4, pipeIdx).toFloat();
+    if (deltaIdx >= 0)              phoneDelta = msg.substring(deltaIdx + 6).toFloat();
+    return;
+  }
+
+  if (topicStr == "robot/control") {
+    Serial.println("\nRECV: [" + msg + "]");
+
+    if (msg == "S") { stopDrive(); Serial.println("[CMD] Stop"); return; }
+
+    if (msg == "SCAN") {
+      float d = scanFront();
+      bool det = (obstacleEnabled && d > 0 && d <= obstacleCm);
+      Serial.printf("[CMD] SCAN -> %.1fcm det=%d\n", d, det);
+      publishObstacle(det, d, 0, 0, '-', "recheck");
+      return;
+    }
+
+    if (msg.startsWith("SPD:")) {
+      speedFwd = constrain(msg.substring(4).toInt(), 60, 255);
+      Serial.printf("[CMD] speedFwd=%d\n", speedFwd);
+      return;
+    }
+    if (msg.startsWith("SPDT:")) {
+      speedTurn = constrain(msg.substring(5).toInt(), 60, 255);
+      Serial.printf("[CMD] speedTurn=%d\n", speedTurn);
+      return;
+    }
+    if (msg.startsWith("SPDN:")) {
+      speedNudge = constrain(msg.substring(5).toInt(), 60, 255);
+      Serial.printf("[CMD] speedNudge=%d\n", speedNudge);
+      return;
+    }
+    if (msg.startsWith("ODIST:")) {
+      obstacleCm = constrain(msg.substring(6).toInt(), 10, 200);
+      Serial.printf("[CMD] obstacleCm=%d\n", obstacleCm);
+      return;
+    }
+    if (msg == "ODET:0") { obstacleEnabled = false; Serial.println("[CMD] obstacle OFF"); return; }
+    if (msg == "ODET:1") { obstacleEnabled = true;  Serial.println("[CMD] obstacle ON");  return; }
+
+    if (msg.startsWith("DRIVE:")) { startDrive(msg.charAt(6)); return; }
+
+    if (msg.startsWith("EXEC:")) {
+      if (msg.length() < 8) return;
+      char cmd  = msg.charAt(5);
+      int  col2 = msg.indexOf(':', 6);
+      if (col2 < 0) return;
+      long val = msg.substring(col2 + 1).toInt();
+      if (val <= 0 || val > 999999) return;
+
+      Serial.printf("[CMD] EXEC %c val:%ld\n", cmd, val);
+      long remaining = 0;
+      switch (cmd) {
+        case 'F': remaining = moveForward(val);  break;
+        case 'B': moveBackward(val);             break;
+        case 'L': moveLeft((float)val);          break;
+        case 'R': moveRight((float)val);         break;
+      }
+      mqttClient.publish("robot/status", (cmd == 'F' && remaining > 0) ? "obstacle" : "done");
+      return;
+    }
+  }
+}
+
+// ── WiFi / MQTT ───────────────────────────────────────────────
+void connectWiFi() {
+  Serial.print("[WIFI] Connecting");
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.println("\n[WIFI] Connected | IP: " + WiFi.localIP().toString());
+}
+void connectMQTT() {
+  while (!mqttClient.connected()) {
+    String id = "RoboNav_" + String((uint32_t)ESP.getEfuseMac(), HEX);
+    if (mqttClient.connect(id.c_str())) {
+      mqttClient.subscribe("robot/control");
+      mqttClient.subscribe("robot/gyro");
+      Serial.println("[MQTT] Connected | subscribed control + gyro");
+    } else { Serial.printf("[MQTT] Failed rc=%d\n", mqttClient.state()); delay(2000); }
+  }
+}
+
+// ── Setup ─────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("\n=== RoboNav v6 — reliable obstacle + tiered turns ===");
+
+  pinMode(IN1,OUTPUT); pinMode(IN2,OUTPUT); pinMode(IN3,OUTPUT); pinMode(IN4,OUTPUT);
+  pinMode(ENA,OUTPUT); pinMode(ENB,OUTPUT);
+  stopMotors();
+
+  pinMode(ENC_L_A, INPUT); pinMode(ENC_L_B, INPUT);
+  pinMode(ENC_R_A, INPUT_PULLUP); pinMode(ENC_R_B, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_A), isrLA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_L_B), isrLB, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_A), isrRA, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(ENC_R_B), isrRB, CHANGE);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  digitalWrite(TRIG_PIN, LOW);
+
+  // Servo: center ONCE and hold straight. Never moved again.
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  scanServo.setPeriodHertz(50);
+  scanServo.attach(SERVO_PIN, 500, 2400);
+  scanServo.write(90);     // straight ahead
+  delay(300);
+  Serial.println("[SETUP] Servo held straight, ultrasonic ready");
+
+  connectWiFi();
+  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(callback);
+  connectMQTT();
+
+  Serial.printf("[SETUP] READY | obstacle stop = %dcm (runtime)\n", obstacleCm);
+}
+
+// ── Loop ──────────────────────────────────────────────────────
+void loop() {
+  if (WiFi.status() != WL_CONNECTED) connectWiFi();
+  if (!mqttClient.connected()) connectMQTT();
+  mqttClient.loop();
+
+  serviceDrive();      // obstacle watch + live distance while holding forward
+  serviceIdlePing();   // idle distance pings (radar)
+
+  static bool wasConnected = false;
+  static unsigned long lastCheck = 0;
+  if (millis() - lastCheck > 3000) {
+    lastCheck = millis();
+    bool now = (millis() - phoneLastMsg < 2000);
+    if (now && !wasConnected) Serial.println("[PHONE] Gyro connected");
+    if (!now && wasConnected) Serial.println("[PHONE] Gyro disconnected");
+    wasConnected = now;
+  }
+}

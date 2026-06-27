@@ -7,7 +7,7 @@ export const connectMQTT = () => {
 
   console.log("Connecting to MQTT...");
 
-  client = mqtt.connect("ws://10.251.95.138:9001", {
+  client = mqtt.connect("ws://10.90.74.138:9001", {
     protocol: "ws",
     reconnectPeriod: 2000,
     connectTimeout: 5000,

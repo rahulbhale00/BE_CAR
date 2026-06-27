@@ -3,39 +3,21 @@
     {
       "cmd": "F",
       "count": 1,
-      "ticks": 400
-    },
-    {
-      "cmd": "R",
-      "count": 1,
-      "ticks": 90
-    },
-    {
-      "cmd": "F",
-      "count": 1,
-      "ticks": 400
-    },
-    {
-      "cmd": "R",
-      "count": 1,
-      "ticks": 90
-    },
-    {
-      "cmd": "F",
-      "count": 1,
-      "ticks": 400
-    },
-    {
-      "cmd": "R",
-      "count": 1,
-      "ticks": 90
+      "ticks": 100
     }
   ],
-  "2-1": [
+  "2-3": [
     {
       "cmd": "F",
       "count": 1,
-      "ticks": 400
+      "ticks": 100
+    }
+  ],
+  "3-1": [
+    {
+      "cmd": "F",
+      "count": 1,
+      "ticks": 100
     }
   ]
 }
